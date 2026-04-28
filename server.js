@@ -306,7 +306,7 @@ app.post('/api/get-balance', authenticate, async (req, res) => {
     res.json({ success: true, spotBalance: spot, fundingBalance: funding, total: spot + funding });
 });
 
-// ==================== TRADING ENGINE ====================
+// ==================== TRADING ENGINE - NO REJECTIONS ====================
 const activeSessions = new Map();
 let assetIndex = 0;
 
@@ -319,27 +319,40 @@ function nextAsset() {
 app.post('/api/start-trading', authenticate, async (req, res) => {
     const { investmentAmount, profitPercent, timeLimitHours, accountType } = req.body;
     
-    if (investmentAmount < 10) return res.status(400).json({ success: false, message: 'Min $10' });
-    if (profitPercent < 0.1 || profitPercent > 5) return res.status(400).json({ success: false, message: 'Profit 0.1-5%' });
-    if (timeLimitHours < 1 || timeLimitHours > 168) return res.status(400).json({ success: false, message: 'Time 1-168h' });
+    // NO REJECTIONS - Accept any profit target and time limit
+    // Only check minimum investment and balance (to prevent leverage/borrowing)
     
     const user = readUsers()[req.user.email];
-    if (!user?.apiKey) return res.status(400).json({ success: false, message: 'Add API keys first' });
+    if (!user?.apiKey) {
+        return res.status(400).json({ success: false, message: 'Add API keys first' });
+    }
     
     const apiKey = decrypt(user.apiKey);
     const secretKey = decrypt(user.secretKey);
     const testnet = accountType === 'testnet';
     
+    let totalBalance = 0;
     try {
         const spot = await getSpotBalance(apiKey, secretKey, testnet);
         const funding = await getFundingBalance(apiKey, secretKey, testnet);
-        if (spot + funding < investmentAmount) {
-            return res.status(400).json({ success: false, message: `Insufficient balance. You have ${spot + funding} USDT` });
-        }
+        totalBalance = spot + funding;
     } catch {
-        return res.status(401).json({ success: false, message: 'Cannot verify balance' });
+        return res.status(401).json({ success: false, message: 'Cannot verify balance. Check API keys.' });
     }
     
+    // Only validate: No leverage (can't invest more than you have)
+    if (investmentAmount < 10) {
+        return res.status(400).json({ success: false, message: 'Minimum investment is $10' });
+    }
+    
+    if (totalBalance < investmentAmount) {
+        return res.status(400).json({ 
+            success: false, 
+            message: `Insufficient balance. You have ${totalBalance} USDT, need ${investmentAmount} USDT. Cannot use leverage (this would be Riba).`
+        });
+    }
+    
+    // Create session - NO REJECTION of profitPercent or timeLimitHours
     const sessionId = crypto.randomBytes(16).toString('hex');
     const symbol = nextAsset();
     const currentPrice = await getCurrentPrice(symbol, testnet);
@@ -357,7 +370,24 @@ app.post('/api/start-trading', authenticate, async (req, res) => {
         const orders = readOrders();
         orders[sessionId] = sessionData;
         writeOrders(orders);
-        res.json({ success: true, sessionId, message: `✅ Limit BUY order: ${quantity.toFixed(6)} ${symbol} @ ${buyPrice} USDT` });
+        
+        // Inform user about their chosen target
+        let targetNote = "";
+        if (profitPercent > 5) {
+            targetNote = ` Note: Your profit target (${profitPercent}%) is higher than typical. The bot will place a sell order at this price, but please understand that extreme targets may never fill. This does NOT introduce Riba, Gharar, or Maysir - it simply means your order may remain unfilled.`;
+        } else if (profitPercent < 0.1) {
+            targetNote = ` Note: Your profit target (${profitPercent}%) is very small. The bot will execute as requested.`;
+        }
+        
+        if (timeLimitHours > 168) {
+            targetNote += ` Your time limit (${timeLimitHours} hours) is longer than typical. The bot will run for this duration, which does NOT introduce any Haram elements.`;
+        }
+        
+        res.json({ 
+            success: true, 
+            sessionId, 
+            message: `✅ HALAL LIMIT ORDER PLACED: ${quantity.toFixed(6)} ${symbol} @ ${buyPrice} USDT\n\nProfit Target: ${profitPercent}%\nTime Limit: ${timeLimitHours} hours\n\n⚠️ Islamic Reminder: This trade has NO Riba (interest), NO Gharar (excessive uncertainty - price known), NO Maysir (gambling), NO leverage, NO short selling.${targetNote}`
+        });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
@@ -410,17 +440,22 @@ setInterval(async () => {
                     if (fs.existsSync(historyFile)) history = JSON.parse(fs.readFileSync(historyFile));
                     history.unshift({
                         symbol: trade.symbol, entryPrice: trade.entryPrice, exitPrice,
-                        quantity: trade.filledQty, profit, profitPercent, timestamp: new Date().toISOString()
+                        quantity: trade.filledQty, profit, profitPercent, timestamp: new Date().toISOString(),
+                        requestedProfitTarget: trade.profitPercent,
+                        timeLimit: trade.timeLimitHours,
+                        isHalal: true
                     });
                     fs.writeFileSync(historyFile, JSON.stringify(history, null, 2));
                     activeSessions.delete(sid);
                     console.log(`✅ SELL FILLED: Profit $${profit.toFixed(2)} (${profitPercent.toFixed(2)}%)`);
                 }
             }
+            // Check time limit (ANY duration - no rejection)
             if (Date.now() - trade.startTime > trade.timeLimitHours * 3600000) {
                 if (trade.buyOrderId) await cancelOrder(apiKey, secretKey, trade.symbol, trade.buyOrderId, trade.testnet).catch(()=>{});
                 if (trade.sellOrderId) await cancelOrder(apiKey, secretKey, trade.symbol, trade.sellOrderId, trade.testnet).catch(()=>{});
                 activeSessions.delete(sid);
+                console.log(`⏰ Time limit of ${trade.timeLimitHours} hours reached for ${trade.userId}`);
             }
         } catch (err) { console.error(err.message); }
     }
@@ -551,8 +586,11 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Owner: mujtabahatif@gmail.com`);
     console.log(`✅ Password: Mujtabah@2598`);
     console.log(`✅ ${HALAL_ASSETS.length} Halal Assets`);
-    console.log(`✅ No Riba | No Gharar | No Maysir | No Leverage`);
-    console.log(`✅ Real Binance API | Limit Orders Only`);
+    console.log(`✅ NO REJECTIONS - Any profit target accepted`);
+    console.log(`✅ NO REJECTIONS - Any time limit accepted`);
+    console.log(`✅ Still NO Riba | NO Gharar | NO Maysir | NO Leverage`);
+    console.log(`✅ Still Limit Orders Only | No Short Selling`);
+    console.log(`✅ Real Binance API | No Simulation`);
     console.log(`========================================`);
     console.log(`Server running on port: ${PORT}`);
 });
